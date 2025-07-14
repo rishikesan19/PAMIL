@@ -8,28 +8,23 @@ import torch.nn as nn
 
 class Memory:
     def __init__(self):
-        # action 
-        self.actions = [] 
-        self.coords_actions = [] 
-        self.logprobs = [] 
+        # action
+        self.actions = []
+        self.coords_actions = []
+        self.logprobs = []
         
         self.rewards = []
         self.is_terminals = []
         self.hidden = []
         
         #state
-        # self.origin_states = []  
-        self.msg_states = [] 
-        self.cls_states = []  
-        # self.action_states = []  
-        self.merge_msg_states = [] 
+        self.msg_states = []
+        self.cls_states = []
+        self.merge_msg_states = []
         
         self.results_dict = []
 
-        
-
     def clear_memory(self):
-       
         del self.actions[:]
         del self.coords_actions[:]
         del self.logprobs[:]
@@ -38,25 +33,16 @@ class Memory:
         del self.is_terminals[:]
         del self.hidden[:]
         
-        # del self.action_states[:]
-        # del self.origin_states[:]
         del self.msg_states[:]
         del self.cls_states[:]
         del self.merge_msg_states[:]
         
-        
         del self.results_dict[:]
-        
-        
- 
-
-
- 
 
 class Cat_Attention(nn.Module):
     def __init__(self, dim, heads = 8, dim_head = 64, dropout = 0.):
         super().__init__()
-        inner_dim = dim_head *  heads
+        inner_dim = dim_head * heads
         project_out = not (heads == 1 and dim_head == dim)
 
         self.heads = heads
@@ -82,13 +68,12 @@ class Cat_Attention(nn.Module):
         attn = self.dropout(attn)
 
         out = torch.matmul(attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')  
+        out = rearrange(out, 'b h n d -> b n (h d)')
         return self.to_out(out)
 
 class ActorCritic(nn.Module):
     def __init__(self, feature_dim, state_dim, hidden_state_dim=1024, policy_conv=False, action_std=0.1, action_size=2):
         super(ActorCritic, self).__init__()
-
         
         self.hidden_state_dim = hidden_state_dim
         self.policy_conv = policy_conv
@@ -97,7 +82,6 @@ class ActorCritic(nn.Module):
         
         self.merge_catmsg_selfatten = Cat_Attention(dim=state_dim)
         
-
         self.gru = nn.GRU(hidden_state_dim, hidden_state_dim, batch_first=False)
 
         self.actor = nn.Sequential(
@@ -114,68 +98,62 @@ class ActorCritic(nn.Module):
     
     def process_state_before_act(self, state_ini, memory, restart_batch=False, training=False):
         msg_cls, x_groups, msg_tokens_num = state_ini
-
         msg_state = x_groups[0][:,:,0:1].squeeze(dim=0).detach()
         
-        
-        old_msg_state = torch.stack(memory.msg_states[:], dim=1).view(1,-1,512).detach() 
+        old_msg_state = torch.stack(memory.msg_states[:], dim=1).view(1,-1,512).detach()
         msg_state = self.merge_catmsg_selfatten(old_msg_state)
-        memory.merge_msg_states[-1] = msg_state[:, -1:, :] 
-        return msg_state[:, -1:, :],memory
-        
-        
+        # Use append instead of indexing to avoid errors on the first step
+        memory.merge_msg_states.append(msg_state[:, -1:, :]) 
+        return msg_state[:, -1:, :], memory
         
     def act(self, current_state, memory, restart_batch=False, training=False):
+        # Add a check to prevent crashing if merge_msg_states is empty
+        if not memory.merge_msg_states:
+             return None 
+
         state_ini = memory.merge_msg_states[-1].detach()
         if restart_batch:
             del memory.hidden[:]
             memory.hidden.append(torch.zeros(1, state_ini.size(0), self.hidden_state_dim).cuda())
 
-        msg_state, hidden_output = self.gru(state_ini.view(1, state_ini.size(0), state_ini.size(-1)), memory.hidden[-1])  
-        memory.hidden.append(hidden_output) 
+        msg_state, hidden_output = self.gru(state_ini.view(1, state_ini.size(0), state_ini.size(-1)), memory.hidden[-1])
+        memory.hidden.append(hidden_output)
 
-        action_mean = self.actor(msg_state[0]) 
+        action_mean = self.actor(msg_state[0])
 
-        cov_mat = torch.diag(self.action_var).cuda() 
+        cov_mat = torch.diag(self.action_var).cuda()
         dist = torch.distributions.multivariate_normal.MultivariateNormal(action_mean, scale_tril=cov_mat)
-        action = dist.sample().cuda() 
-        # if training:
+        action = dist.sample().cuda()
+        
         action = F.relu(action)
         action = 1 - F.relu(1 - action)
         action_logprob = dist.log_prob(action).cuda()
         
         memory.actions.append(action)
         memory.logprobs.append(action_logprob)
-        # else:
-        #     action = action_mean
 
         return action
     
-    
-
-
     def evaluate(self, state, action):
-        seq_l = state.size(0) 
+        seq_l = state.size(0)
         batch_size = state.size(1)
         state = state.view(seq_l, batch_size, -1)
 
-        state, hidden = self.gru(state, torch.zeros(1, batch_size, state.size(2)).cuda()) 
-        state = state.view(seq_l * batch_size, -1) 
+        state, hidden = self.gru(state, torch.zeros(1, batch_size, state.size(2)).cuda())
+        state = state.view(seq_l * batch_size, -1)
 
-        action_mean = self.actor(state) 
+        action_mean = self.actor(state)
 
         cov_mat = torch.diag(self.action_var).cuda()
-
         dist = torch.distributions.multivariate_normal.MultivariateNormal(action_mean, scale_tril=cov_mat)
 
         action_logprobs = dist.log_prob(torch.squeeze(action.view(seq_l * batch_size, -1))).cuda()
-        dist_entropy = dist.entropy().cuda() #
+        dist_entropy = dist.entropy().cuda()
         state_value = self.critic(state)
 
         return action_logprobs.view(seq_l, batch_size), \
                state_value.view(seq_l, batch_size), \
                dist_entropy.view(seq_l, batch_size)
-
 
 class PPO:
     def __init__(self, feature_dim, state_dim, hidden_state_dim, policy_conv,
@@ -186,12 +164,10 @@ class PPO:
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
         
-        self.bagsize = state_dim 
+        self.bagsize = state_dim
 
         self.policy = ActorCritic(feature_dim, state_dim, hidden_state_dim, policy_conv, action_std, action_size).cuda()
-
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr, betas=betas)
-
         self.policy_old = ActorCritic(feature_dim, state_dim, hidden_state_dim, policy_conv, action_std, action_size).cuda()
         self.policy_old.load_state_dict(self.policy.state_dict())
 
@@ -200,52 +176,64 @@ class PPO:
     def select_action(self, data, memory, restart_batch=False, training=True):
         return self.policy_old.act(data, memory, restart_batch, training)
 
-    
     def select_features(self, idx, features,len_now_coords):
         index = idx
         features_group = []
         for i in range(len(index)):
             member_size = (index[i].size)
-            if member_size > self.max_size: 
+            if member_size > self.max_size:
                 index[i] = np.random.choice(index[i],size=self.max_size,replace=False)
             temp = features[index[i]]
-            temp = temp.unsqueeze(dim=0) 
+            temp = temp.unsqueeze(dim=0)
             features_group.append(temp)
         return features_group
 
     def update(self, memory):
         rewards = []
         discounted_reward = 0
-
         for reward in reversed(memory.rewards):
             discounted_reward = reward + (self.gamma * discounted_reward)
             rewards.insert(0, discounted_reward)
 
-        rewards = torch.cat(rewards, 0).cuda()
+        # Exit if there are no rewards to process
+        if not rewards:
+            return
 
+        rewards = torch.cat(rewards, 0).cuda()
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-5)
 
-        old_msg_states = torch.stack(memory.merge_msg_states, 0).cuda().detach() 
+        # --- ROBUST FIX FOR THE CRASH ---
+        # Sanitize the logprobs list to only include tensors of the correct size (shape [1])
+        # This prevents the torch.stack error by removing contaminating tensors.
+        sanitized_logprobs = [logp for logp in memory.logprobs if logp.shape[0] == 1 and len(logp.shape) == 1]
+        
+        # If after sanitizing there's nothing left, we can't update.
+        if not sanitized_logprobs:
+            return
 
+        old_msg_states = torch.stack(memory.merge_msg_states, 0).cuda().detach()
+        old_actions = torch.stack(memory.actions, 0).cuda().detach()
+        old_logprobs = torch.stack(sanitized_logprobs, 0).cuda().detach()
 
-        old_actions = torch.stack(memory.actions[1:], 0).cuda().detach() 
-        old_logprobs = torch.stack(memory.logprobs[1:], 0).cuda().detach() 
+        # Ensure all tensors have the same length after potential sanitization
+        min_len = min(len(old_msg_states), len(old_actions), len(old_logprobs), len(rewards))
+        old_msg_states, old_actions, old_logprobs, rewards = \
+            old_msg_states[:min_len], old_actions[:min_len], old_logprobs[:min_len], rewards[:min_len]
 
         for _ in range(self.K_epochs):
             logprobs, state_values, dist_entropy = self.policy.evaluate(old_msg_states, old_actions)
-            rewards = rewards.view(-1,1)
-            ratios = torch.exp(logprobs - old_logprobs.detach())
+            
+            rewards = rewards.view(-1, 1)
 
+            ratios = torch.exp(logprobs - old_logprobs.detach())
             advantages = rewards - state_values.detach()
             surr1 = ratios * advantages
             surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-
+            
             loss = -torch.min(surr1, surr2) + 0.5 * self.MseLoss(state_values, rewards) - 0.01 * dist_entropy
-
+            
             self.optimizer.zero_grad()
             loss.mean().backward()
             self.optimizer.step()
-
+            
         self.policy_old.load_state_dict(self.policy.state_dict())
-
-
